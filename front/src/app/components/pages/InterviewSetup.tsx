@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate } from "react-router";
 import {
   Play,
@@ -9,8 +9,11 @@ import {
   FolderOpen,
   ChevronDown,
   Info,
+  Loader2,
 } from "lucide-react";
-import { mockDocuments } from "../../data/mockData";
+import { documentsApi, type ApiDocument } from "../../api/documents";
+import { interviewsApi, type CreateInterviewRequest } from "../../api/interviews";
+import { ApiError } from "../../api/client";
 
 type InterviewType = "technical" | "behavioral" | "mixed";
 type Difficulty = "basic" | "medium" | "challenge";
@@ -44,8 +47,21 @@ const roleLabels: Record<RoleDirection, string> = {
   fullstack: "全栈开发",
 };
 
-const jdDocs = mockDocuments.filter((d) => d.type === "jd");
-const hasResume = mockDocuments.some((d) => d.type === "resume" && d.parseStatus === "completed");
+const roleDirectionCN: Record<RoleDirection, string> = {
+  backend: "后端开发工程师",
+  frontend: "前端开发工程师",
+  algorithm: "算法工程师",
+  data: "数据分析师",
+  ai: "AI 应用开发工程师",
+  fullstack: "全栈开发工程师",
+};
+
+/** Frontend "challenge" maps to backend "hard" */
+const difficultyMap: Record<Difficulty, "basic" | "medium" | "hard"> = {
+  basic: "basic",
+  medium: "medium",
+  challenge: "hard",
+};
 
 function SegmentedControl<T extends string | number>({
   options,
@@ -81,10 +97,14 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean
       role="switch"
       aria-checked={checked}
       onClick={() => onChange(!checked)}
-      className={`relative w-10 h-5 rounded-full transition-colors ${checked ? "bg-[#2563EB]" : "bg-[#D1D5DB]"}`}
+      className={`relative w-10 h-5 rounded-full transition-colors ${
+        checked ? "bg-[#2563EB]" : "bg-[#D1D5DB]"
+      }`}
     >
       <span
-        className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${checked ? "translate-x-5" : "translate-x-0"}`}
+        className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${
+          checked ? "translate-x-5" : "translate-x-0"
+        }`}
       />
     </button>
   );
@@ -104,10 +124,15 @@ const coverageTopics: Record<InterviewType, string[]> = {
 
 export function InterviewSetup() {
   const navigate = useNavigate();
+  const [docs, setDocs] = useState<ApiDocument[]>([]);
+  const [docsLoading, setDocsLoading] = useState(true);
+  const [starting, setStarting] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
+
   const [config, setConfig] = useState<Config>({
     type: "mixed",
     role: "backend",
-    jdId: jdDocs[0]?.id ?? "",
+    jdId: "",
     difficulty: "medium",
     duration: 20,
     followUp: true,
@@ -115,17 +140,68 @@ export function InterviewSetup() {
     languageStyle: "formal",
   });
 
+  useEffect(() => {
+    documentsApi
+      .list()
+      .then((data) => {
+        setDocs(data);
+        // Pre-select first JD if available
+        const firstJd = data.find((d) => d.source_type === "jd" && d.parse_status === "completed");
+        if (firstJd) {
+          setConfig((prev) => ({ ...prev, jdId: firstJd.id }));
+        }
+      })
+      .catch(() => setDocs([]))
+      .finally(() => setDocsLoading(false));
+  }, []);
+
   const update = <K extends keyof Config>(key: K, value: Config[K]) =>
     setConfig((prev) => ({ ...prev, [key]: value }));
 
-  const canStart = hasResume;
+  const jdDocs = docs.filter((d) => d.source_type === "jd" && d.parse_status === "completed");
+  const hasResume = docs.some(
+    (d) => d.source_type === "resume" && d.parse_status === "completed"
+  );
+  const hasProject = docs.some(
+    (d) => d.source_type === "project" && d.parse_status === "completed"
+  );
+  const canStart = hasResume && !starting;
   const hasJd = config.jdId !== "";
 
   const qCount = estimatedQuestions[config.type][config.duration];
   const topics = coverageTopics[config.type];
 
-  const handleStart = () => {
-    navigate(`/interviews/new-${Date.now()}`);
+  const handleStart = async () => {
+    if (!canStart) return;
+    setStarting(true);
+    setStartError(null);
+    try {
+      const req: CreateInterviewRequest = {
+        user_id: "default",
+        mode: config.type,
+        role_direction: roleDirectionCN[config.role],
+        difficulty: difficultyMap[config.difficulty],
+        duration_minutes: config.duration,
+        max_questions: qCount,
+        enable_follow_up: config.followUp,
+      };
+      const res = await interviewsApi.create(req);
+      navigate(`/interviews/${res.session_id}`, {
+        state: {
+          question: res.question,
+          mode: config.type,
+          role: roleLabels[config.role],
+          maxQuestions: qCount,
+          difficulty: config.difficulty,
+        },
+      });
+    } catch (err) {
+      setStartError(
+        err instanceof ApiError ? err.message : "创建面试失败，请检查后端服务是否启动"
+      );
+    } finally {
+      setStarting(false);
+    }
   };
 
   return (
@@ -158,38 +234,57 @@ export function InterviewSetup() {
             <div className="relative">
               <select
                 value={config.role}
-                onChange={e => update("role", e.target.value as RoleDirection)}
+                onChange={(e) => update("role", e.target.value as RoleDirection)}
                 className="w-full appearance-none border border-[#E5E7EB] rounded px-3 py-2 text-[14px] text-[#111827] bg-white focus:outline-none focus:ring-1 focus:ring-[#2563EB] focus:border-[#2563EB]"
               >
                 {Object.entries(roleLabels).map(([k, v]) => (
-                  <option key={k} value={k}>{v}</option>
+                  <option key={k} value={k}>
+                    {v}
+                  </option>
                 ))}
               </select>
-              <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-[#9CA3AF] pointer-events-none" />
+              <ChevronDown
+                size={14}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-[#9CA3AF] pointer-events-none"
+              />
             </div>
           </div>
 
           {/* Target JD */}
           <div className="bg-white border border-[#E5E7EB] rounded-lg p-4">
             <label className="block text-[13px] font-medium text-[#374151] mb-2">目标 JD</label>
-            <div className="relative mb-2">
-              <select
-                value={config.jdId}
-                onChange={e => update("jdId", e.target.value)}
-                className="w-full appearance-none border border-[#E5E7EB] rounded px-3 py-2 text-[14px] text-[#111827] bg-white focus:outline-none focus:ring-1 focus:ring-[#2563EB] focus:border-[#2563EB]"
-              >
-                <option value="">不指定 JD（使用通用岗位能力）</option>
-                {jdDocs.map(d => (
-                  <option key={d.id} value={d.id}>{d.filename}</option>
-                ))}
-              </select>
-              <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-[#9CA3AF] pointer-events-none" />
-            </div>
-            {!hasJd && (
-              <div className="flex items-start gap-1.5 text-[12px] text-[#D97706]">
-                <AlertCircle size={13} className="mt-0.5 shrink-0" />
-                将基于简历和通用岗位能力生成问题，建议上传 JD 提升匹配度
+            {docsLoading ? (
+              <div className="flex items-center gap-2 text-[13px] text-[#9CA3AF] py-2">
+                <Loader2 size={13} className="animate-spin" />
+                加载中...
               </div>
+            ) : (
+              <>
+                <div className="relative mb-2">
+                  <select
+                    value={config.jdId}
+                    onChange={(e) => update("jdId", e.target.value)}
+                    className="w-full appearance-none border border-[#E5E7EB] rounded px-3 py-2 text-[14px] text-[#111827] bg-white focus:outline-none focus:ring-1 focus:ring-[#2563EB] focus:border-[#2563EB]"
+                  >
+                    <option value="">不指定 JD（使用通用岗位能力）</option>
+                    {jdDocs.map((d) => (
+                      <option key={d.id} value={d.id}>
+                        {d.filename}
+                      </option>
+                    ))}
+                  </select>
+                  <ChevronDown
+                    size={14}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-[#9CA3AF] pointer-events-none"
+                  />
+                </div>
+                {!hasJd && (
+                  <div className="flex items-start gap-1.5 text-[12px] text-[#D97706]">
+                    <AlertCircle size={13} className="mt-0.5 shrink-0" />
+                    将基于简历和通用岗位能力生成问题，建议上传 JD 提升匹配度
+                  </div>
+                )}
+              </>
             )}
           </div>
 
@@ -234,53 +329,67 @@ export function InterviewSetup() {
                 <div className="text-[14px] text-[#111827]">追问模式</div>
                 <div className="text-[12px] text-[#9CA3AF]">面试官会对回答进行深入追问</div>
               </div>
-              <Toggle checked={config.followUp} onChange={v => update("followUp", v)} />
+              <Toggle checked={config.followUp} onChange={(v) => update("followUp", v)} />
             </div>
             <div className="flex items-center justify-between">
               <div>
                 <div className="text-[14px] text-[#111827]">参考答案</div>
                 <div className="text-[12px] text-[#9CA3AF]">面试结束后在报告中生成</div>
               </div>
-              <Toggle checked={config.referenceAnswer} onChange={v => update("referenceAnswer", v)} />
+              <Toggle
+                checked={config.referenceAnswer}
+                onChange={(v) => update("referenceAnswer", v)}
+              />
             </div>
             <div>
               <div className="text-[14px] text-[#111827] mb-2">语言风格</div>
               <div className="relative">
                 <select
                   value={config.languageStyle}
-                  onChange={e => update("languageStyle", e.target.value as LanguageStyle)}
+                  onChange={(e) => update("languageStyle", e.target.value as LanguageStyle)}
                   className="w-full appearance-none border border-[#E5E7EB] rounded px-3 py-2 text-[14px] text-[#111827] bg-white focus:outline-none focus:ring-1 focus:ring-[#2563EB] focus:border-[#2563EB]"
                 >
                   <option value="formal">正式面试官</option>
                   <option value="friendly">友好教练</option>
                   <option value="pressure">压力面试</option>
                 </select>
-                <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-[#9CA3AF] pointer-events-none" />
+                <ChevronDown
+                  size={14}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-[#9CA3AF] pointer-events-none"
+                />
               </div>
             </div>
           </div>
 
           {/* Start button */}
           <div>
-            {!canStart && (
+            {!hasResume && !docsLoading && (
               <div className="mb-2 flex items-start gap-2 p-3 bg-[#FEF2F2] border border-[#FECACA] rounded">
                 <AlertCircle size={14} className="text-[#DC2626] mt-0.5 shrink-0" />
-                <span className="text-[13px] text-[#DC2626]">
-                  需要先上传简历才能开始面试
-                </span>
+                <span className="text-[13px] text-[#DC2626]">需要先上传并解析简历才能开始面试</span>
+              </div>
+            )}
+            {startError && (
+              <div className="mb-2 flex items-start gap-2 p-3 bg-[#FEF2F2] border border-[#FECACA] rounded">
+                <AlertCircle size={14} className="text-[#DC2626] mt-0.5 shrink-0" />
+                <span className="text-[13px] text-[#DC2626]">{startError}</span>
               </div>
             )}
             <button
               onClick={handleStart}
-              disabled={!canStart}
+              disabled={!canStart || docsLoading}
               className={`w-full flex items-center justify-center gap-2 py-2.5 rounded text-[15px] font-medium transition-colors ${
-                canStart
+                canStart && !docsLoading
                   ? "bg-[#2563EB] text-white hover:bg-[#1D4ED8]"
                   : "bg-[#E5E7EB] text-[#9CA3AF] cursor-not-allowed"
               }`}
             >
-              <Play size={16} />
-              开始模拟面试
+              {starting ? (
+                <Loader2 size={16} className="animate-spin" />
+              ) : (
+                <Play size={16} />
+              )}
+              {starting ? "正在初始化面试..." : "开始模拟面试"}
             </button>
           </div>
         </div>
@@ -297,15 +406,23 @@ export function InterviewSetup() {
               </div>
               <div className="flex items-center justify-between">
                 <span className="text-[13px] text-[#6B7280]">面试时长</span>
-                <span className="text-[13px] font-semibold text-[#111827]">{config.duration} 分钟</span>
+                <span className="text-[13px] font-semibold text-[#111827]">
+                  {config.duration} 分钟
+                </span>
               </div>
               <div className="flex items-center justify-between">
                 <span className="text-[13px] text-[#6B7280]">岗位方向</span>
-                <span className="text-[13px] font-semibold text-[#111827]">{roleLabels[config.role]}</span>
+                <span className="text-[13px] font-semibold text-[#111827]">
+                  {roleLabels[config.role]}
+                </span>
               </div>
               <div className="flex items-center justify-between">
                 <span className="text-[13px] text-[#6B7280]">追问</span>
-                <span className={`text-[13px] font-semibold ${config.followUp ? "text-[#16A34A]" : "text-[#6B7280]"}`}>
+                <span
+                  className={`text-[13px] font-semibold ${
+                    config.followUp ? "text-[#16A34A]" : "text-[#6B7280]"
+                  }`}
+                >
                   {config.followUp ? "已开启" : "已关闭"}
                 </span>
               </div>
@@ -314,8 +431,11 @@ export function InterviewSetup() {
             <div className="mt-4 pt-3 border-t border-[#E5E7EB]">
               <div className="text-[12px] text-[#6B7280] mb-2">覆盖知识范围</div>
               <div className="flex flex-wrap gap-1.5">
-                {topics.map(t => (
-                  <span key={t} className="text-[11px] px-2 py-0.5 bg-[#EFF6FF] text-[#2563EB] rounded-full">
+                {topics.map((t) => (
+                  <span
+                    key={t}
+                    className="text-[11px] px-2 py-0.5 bg-[#EFF6FF] text-[#2563EB] rounded-full"
+                  >
                     {t}
                   </span>
                 ))}
@@ -326,25 +446,53 @@ export function InterviewSetup() {
           {/* Resource status */}
           <div className="bg-white border border-[#E5E7EB] rounded-lg p-4">
             <h3 className="text-[14px] font-semibold text-[#111827] mb-3">资料准备状态</h3>
-            <div className="space-y-2">
-              {[
-                { label: "简历", icon: FileText, ok: hasResume, msg: hasResume ? "已上传并解析" : "未上传，请先上传简历" },
-                { label: "目标 JD", icon: Briefcase, ok: hasJd, msg: hasJd ? jdDocs.find(d => d.id === config.jdId)?.filename : "未指定，将使用通用能力模型" },
-                { label: "项目资料", icon: FolderOpen, ok: mockDocuments.some(d => d.type === "project" && d.indexed), msg: "已上传并入库" },
-              ].map(({ label, icon: Icon, ok, msg }) => (
-                <div key={label} className="flex items-start gap-2">
-                  {ok ? (
-                    <CheckCircle2 size={14} className="text-[#16A34A] mt-0.5 shrink-0" />
-                  ) : (
-                    <AlertCircle size={14} className="text-[#D97706] mt-0.5 shrink-0" />
-                  )}
-                  <div>
-                    <div className="text-[13px] font-medium text-[#111827]">{label}</div>
-                    <div className={`text-[12px] ${ok ? "text-[#6B7280]" : "text-[#D97706]"} truncate max-w-[180px]`}>{msg}</div>
+            {docsLoading ? (
+              <div className="flex items-center gap-2 text-[13px] text-[#9CA3AF]">
+                <Loader2 size={13} className="animate-spin" />
+                检查资料中...
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {[
+                  {
+                    label: "简历",
+                    icon: FileText,
+                    ok: hasResume,
+                    msg: hasResume ? "已上传并解析" : "未上传，请先上传简历",
+                  },
+                  {
+                    label: "目标 JD",
+                    icon: Briefcase,
+                    ok: hasJd,
+                    msg: hasJd
+                      ? jdDocs.find((d) => d.id === config.jdId)?.filename
+                      : "未指定，将使用通用能力模型",
+                  },
+                  {
+                    label: "项目资料",
+                    icon: FolderOpen,
+                    ok: hasProject,
+                    msg: hasProject ? "已上传并入库" : "未上传，可补充以提升面试质量",
+                  },
+                ].map(({ label, icon: Icon, ok, msg }) => (
+                  <div key={label} className="flex items-start gap-2">
+                    {ok ? (
+                      <CheckCircle2 size={14} className="text-[#16A34A] mt-0.5 shrink-0" />
+                    ) : (
+                      <AlertCircle size={14} className="text-[#D97706] mt-0.5 shrink-0" />
+                    )}
+                    <div>
+                      <div className="text-[13px] font-medium text-[#111827]">{label}</div>
+                      <div
+                        className={`text-[12px] ${ok ? "text-[#6B7280]" : "text-[#D97706]"} truncate max-w-[180px]`}
+                      >
+                        {msg}
+                      </div>
+                    </div>
                   </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* Tips */}
@@ -354,7 +502,9 @@ export function InterviewSetup() {
               <div className="space-y-1.5">
                 <p className="text-[12px] text-[#0C4A6E]">面试过程中可以随时暂停，回答不会丢失</p>
                 <p className="text-[12px] text-[#0C4A6E]">面试结束后自动生成结构化报告</p>
-                <p className="text-[12px] text-[#0C4A6E]">追问模式开启时，面试官会根据你的回答深入提问</p>
+                <p className="text-[12px] text-[#0C4A6E]">
+                  追问模式开启时，面试官会根据你的回答深入提问
+                </p>
               </div>
             </div>
           </div>
